@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-my $Version  = 'UPB Interface v1.1';
+my $Version  = 'UPB Interface v1.3';
 
 # UPB Interface
 #
@@ -29,7 +29,7 @@ Usage:
        -network <network>
        -device <device>
 
-     -debug           : Place in debug mode.
+     -debug <mode>    : Place in debug mode.
 
 VALID STATES:
      ON    : Set a device level 100%.
@@ -37,6 +37,11 @@ VALID STATES:
      TOGGLE: Toggle ON/OFF state.
      LEVEL : Set a light device level to <arg>%.
      BLINK : Set a device to blink at rate <arg>.
+
+VALID DEBUG MODES:
+     UPB
+     UPNP
+     ALL
 
 EndUsage
   }
@@ -60,6 +65,15 @@ use strict;
 use constant {
 	TRUE			=> 1,
 	FALSE			=> 0,
+
+	DEBUG_UPB		=> 0x01,
+	DEBUG_UPNP 		=> 0x02,
+	DEBUG_ALL		=> 0x03, 
+
+	TYPE_DEVICE		=> 0x01,
+	TYPE_SCENE		=> 0x02,
+
+	SIG_CHECK_INTERVAL	=> 300,
 
 	UPB_ACCEPT		=> 0x00,
 	UPB_ACK			=> 0x01,
@@ -162,6 +176,7 @@ my %DEV_STATES;
 my %DEV_SETS;
 my $CONFIG;
 my %CTS;
+my %CTR;
 my %CLIENTS;
 my $TOPLEVEL = FALSE;
 my $UPNP_CHILD;
@@ -177,6 +192,7 @@ my %UPNP_SOCKET_NAME;
 %DEV_STATES = ();
 %DEV_SETS = ();
 %CTS = ();
+%CTR = ();
 
 # Debug stuff
 my $_DEBUG_;
@@ -217,12 +233,12 @@ sub getArgs {
 			    'state'		=> \$state,
 			    'argument=s'	=> \$argument,
 			    'decode=s'		=> \$decode,
-			    'debug'		=> \$_DEBUG_)) {
+			    'debug:s'		=> \$_DEBUG_)) {
 		print "Invalid parameters given.\n";
 		usage();
 	}
 
-	$_DEBUG_ = TRUE if (defined($_DEBUG_));
+	$_DEBUG_ = DEBUG_UPB if (defined($_DEBUG_) && !$_DEBUG_);
 	$config = $DEF_CONFIG if (!$config);
 	$server = TRUE if (defined($server));
 	$monitor = TRUE if (defined($monitor));
@@ -261,6 +277,14 @@ sub getArgs {
 		if (!$argument) {
 			print "State LEVEL requires -argument.\n";
 		}
+	}
+
+	if ($_DEBUG_ =~ /UPNP/i) {
+		$_DEBUG_ = DEBUG_UPNP;
+	} elsif ($_DEBUG_ =~ /UPB/i) {
+		$_DEBUG_ = DEBUG_UPB;
+	} elsif ($_DEBUG_ =~ /ALL/i) {
+		$_DEBUG_ = DEBUG_UPNP | DEBUG_UPB;
 	}
 
 	return ($config, $server, $listen, $monitor, $wemo, $pim, $network,
@@ -309,6 +333,7 @@ sub startServer {
 	tie %IN_QUEUE, 'IPC::Shareable', 'upbi', \%serverOpts;
 	tie %OUT_QUEUE, 'IPC::Shareable', 'upbo', \%serverOpts;
 	tie %CTS, 'IPC::Shareable', 'upbc', \%serverOpts;
+	tie %CTR, 'IPC::Shareable', 'upbr', \%serverOpts;
 
 	my $pims = $$CONFIG{'PIMS'}->{'PIM'};
 
@@ -323,6 +348,7 @@ sub startServer {
 		spawnPoller($pim, $host, $port);
 
 		setClearToSend($pim, TRUE);
+		setClearToReceive($pim, TRUE);
 
 		setMessageMode($pim);
 		getRegisters($pim, 0, 0xff);
@@ -337,8 +363,7 @@ sub startServer {
 
 	if ($wemo) {
 		logEvent("Emulating WeMo devices.");
-		my $upnp_socket;
-		$upnp_socket = openUPnPListenSocket();
+		my $upnp_socket = openUPnPListenSocket();
 		startUPnPBroadcastMonitor($upnp_socket);
 		openUPnPDeviceSockets();
 	}
@@ -353,15 +378,28 @@ sub startServer {
 
 	logEvent("Initialization complete.");
 
+	my $now = time();
+
+	# Get initial signal/noise readings
+	foreach my $pim (keys %{$pims}) {
+		checkDeviceSignatures();
+	}
+
 	while(TRUE) {
 		checkForUPnPConnection();
 
 		foreach my $pim (keys %{$pims}) {
 			checkDeviceSets($pim);
-			parseResponse($pim, popResponseQueue($pim));
+			parseResponse($pim, popResponseQueue($pim)) if (isClearToReceive($pim));
 			checkPendingQueue($pim);
 			checkForConnection($listener);
+
+			if ($now < (time() - SIG_CHECK_INTERVAL)) {
+				checkDeviceSignatures();
+			}
 		}
+
+		$now = time() if ($now < (time() - SIG_CHECK_INTERVAL));
 
 		sleep .1;
 	}
@@ -522,8 +560,35 @@ sub openUPnPDeviceSockets {
 				$UPNP_SOCKET_NAME{$socket}->{'PIM'}     = $pim;
 				$UPNP_SOCKET_NAME{$socket}->{'NETWORK'} = $network;
 				$UPNP_SOCKET_NAME{$socket}->{'DEVICE'}  = $device;
+				$UPNP_SOCKET_NAME{$socket}->{'TYPE'}    = TYPE_DEVICE;
 			}
 		}
+	}
+
+	my $scenes = $$CONFIG{'SCENES'};
+
+	foreach my $scene (keys %{$$scenes{'SCENE'}}) {
+		my $name = popkey($$scenes{'SCENE'}->{$scene}->{'WEMO_NAME'});
+		my $upnp_port = popkey($$scenes{'SCENE'}->{$scene}->{'UPNP_PORT'});
+
+		logEvent("Opening UPnP Device listener for scene \"$name\" on port $upnp_port.");
+
+		my $socket = IO::Socket::INET->new(LocalHost => $ip,
+			 			   LocalPort => $upnp_port,
+						   Proto => 'tcp',
+						   Listen => 1,
+			  			   Reuse => 1);
+
+		if (!$socket) {
+			logEvent("FATAL: Unable to open UPnP Scene listening socket on port $upnp_port, aborting.");
+			commitSuicide();
+		}
+
+		fcntl($socket, F_SETFL(), O_NONBLOCK());
+
+		push @UPNP_DEV_SOCKETS, $socket;
+		$UPNP_SOCKET_NAME{$socket}->{'NAME'}    = $name;
+		$UPNP_SOCKET_NAME{$socket}->{'TYPE'}    = TYPE_SCENE;
 	}
 }
 
@@ -535,7 +600,7 @@ sub startMonitor {
 	$handle = \*STDOUT if (ref($handle) eq 'GLOB');
 
 	while (TRUE) {
-		checkStateDifferences($handle, \%current_states);
+		reportStateDifferences($handle, \%current_states);
 		checkMonitorInput($socket);
 
 		sleep .2;
@@ -635,11 +700,10 @@ sub spawnPoller {
 		tie %IN_QUEUE, 'IPC::Shareable', 'upbi', \%pollerOpts;
 		tie %OUT_QUEUE, 'IPC::Shareable', 'upbo', \%pollerOpts;
 		tie %CTS, 'IPC::Shareable', 'upbc', \%pollerOpts;
+		tie %CTR, 'IPC::Shareable', 'upbr', \%pollerOpts;
 
 		# Notify our main process..
-		(tied %IN_QUEUE)->shlock;
-		push @{$IN_QUEUE{$pim}}, '__POLLER_STARTED__';
-		(tied %IN_QUEUE)->shunlock;
+		pushResponseQueue($pim, '__POLLER_STARTED__');
 
 		while (TRUE) {
 			checkIncomingData($pim, $sock);
@@ -700,9 +764,7 @@ sub checkIncomingData {
 
 	if ($response) {
 		foreach my $single (split(/\x0d/, $response)) {
-			(tied %IN_QUEUE)->shlock;
-			push @{$IN_QUEUE{$pim}}, $single;
-			(tied %IN_QUEUE)->shunlock;
+			pushResponseQueue($pim, $single);
 		}
 	}
 }
@@ -716,6 +778,15 @@ sub pushCommandQueue {
 		push @{$OUT_QUEUE{$pim}}, $command;
 		(tied %OUT_QUEUE)->shunlock;
 	}
+}
+
+sub pushResponseQueue {
+	my $pim = shift;
+	my $response = shift;
+
+	(tied %IN_QUEUE)->shlock;
+	push @{$IN_QUEUE{$pim}}, $response;
+	(tied %IN_QUEUE)->shunlock;
 }
 
 sub popResponseQueue {
@@ -736,12 +807,16 @@ sub sendCommand {
 	my $command = shift;
 	my $response;
 
+	setClearToReceive($pim, FALSE);
+
 	pushCommandQueue($pim, $command);
 
 	while (!$response) {
 		$response = popResponseQueue($pim);
 		sleep 0.5 if (!$response);
 	}
+
+	setClearToReceive($pim, TRUE);
 
 	return $response;
 }
@@ -757,11 +832,10 @@ sub sendUPBCommand {
 	return sendCommand($pim, $command);
 }
 
-sub sendPIMReadCommand {
+sub sendPIMWriteCommand {
 	my $pim = shift;
 	my $command = shift;
-	my $prefix = "\x12";
-	my $expected_responses = 1;
+	my $prefix = "\x17";
 
 	$command .= getChecksumHex($command);
 	$command  = $prefix . $command;
@@ -769,10 +843,10 @@ sub sendPIMReadCommand {
 	return sendCommand($pim, $command);
 }
 
-sub sendPIMWriteCommand {
+sub sendPIMReadCommand {
 	my $pim = shift;
 	my $command = shift;
-	my $prefix = "\x17";
+	my $prefix = "\x12";
 
 	$command .= getChecksumHex($command);
 	$command  = $prefix . $command;
@@ -794,7 +868,7 @@ sub setMessageMode {
 	}
 }
 
-sub getDeviceRegisters {
+sub getDeviceRegistersReport {
 	my $pim = shift;
 	my $network = shift;
 	my $device = shift;
@@ -807,6 +881,20 @@ sub getDeviceRegisters {
 	return setCore($pim, $network, $source, $device, RPT_REGISTERS, $start, $end);
 }
 
+sub getDeviceSignatureReport {
+	my $pim = shift;
+	my $network = shift;
+	my $device = shift;
+
+	logEvent("Requesting device signature report for device $device on pim $pim, network $network.")
+	  if ($_DEBUG_ & DEBUG_UPB);
+
+	my $pims = $$CONFIG{'PIMS'}->{'PIM'};
+	my $source = popkey($$pims{$pim}->{'DEVICE'});
+
+	return setCore($pim, $network, $source, $device, RPT_DEV_SIGNATURE);
+}
+
 sub getRegisters {
 	my $pim = shift;
 	my $start = shift;
@@ -815,7 +903,6 @@ sub getRegisters {
 	logEvent("PIM '$pim': Getting registers.");
 
 	my $command = sprintf("%02X%02X", $start, $end);
-
 	my $raw = sendPIMReadCommand($pim, $command);
 	my $response = parseResponse($pim, $raw);
 
@@ -916,16 +1003,17 @@ sub readUPB {
 
 	$buff =~ s/\x0d$//;
 
-	if ($_DEBUG_) {
+	if ($_DEBUG_ & DEBUG_UPB) {
 		foreach my $response (split(/\x0d/, $buff)) {
-			logEvent("RECEIVED: $response");
+			logEvent("Received response:");
+			logEvent(hex_ascii(to_hex($response)));
 		}
 	}
 
 	return $buff;
 }
 
-sub readRemote {
+sub readSocketRemote {
 	my $socket = shift;
 	my $buff = '';
 
@@ -963,7 +1051,7 @@ sub sendRemote {
 
 	print $sock $cmd;
 
-	logEvent("PIM '$pim': SENT: $cmd") if ($_DEBUG_);
+	logEvent("PIM '$pim': SENT: $cmd") if ($_DEBUG_ & DEBUG_UPB);
 }
 
 sub checkDeviceStates {
@@ -979,13 +1067,31 @@ sub checkDeviceStates {
  				my $dev_type = popkey($$devices{$device}->{'TYPE'});
  				next if ($dev_type =~ /Virtual/i);
 				getDeviceState($pim, $network, $device);
-				#getDeviceRegisters($pim, $network, $device, 0x00, 0x10);
+				#getDeviceRegistersReport($pim, $network, $device, 0x00, 0x10);
 			}
 		}
 	}
 }
 
-sub checkStateDifferences {
+sub checkDeviceSignatures {
+	logEvent("Checking current device signatures.");
+
+	my $pims = $$CONFIG{'NETWORKS'}->{'PIM'};
+
+	foreach my $pim (keys %{$pims}) {
+		foreach my $network (sort keys %{$$pims{$pim}->{'NETWORK'}}) {
+			my $devices = $$pims{$pim}->{'NETWORK'}->{$network}->{'DEVICE'};
+
+			foreach my $device (sort keys %{$devices}) {
+ 				my $dev_type = popkey($$devices{$device}->{'TYPE'});
+ 				next if ($dev_type =~ /Virtual/i);
+				getDeviceSignatureReport($pim, $network, $device);
+			}
+		}
+	}
+}
+
+sub reportStateDifferences {
 	my $handle = shift;
 	my $current = shift;
 
@@ -995,12 +1101,12 @@ sub checkStateDifferences {
 		foreach my $network (keys %{$DEV_STATES{$pim}}) {
 			foreach my $device (keys %{$DEV_STATES{$pim}->{$network}}) {
 				my $devices = $$CONFIG{'NETWORKS'}->{'PIM'}->{$pim}->{'NETWORK'}->{$network}->{'DEVICE'};
-				my $level = $DEV_STATES{$pim}->{$network}->{$device};
+				my $level = $DEV_STATES{$pim}->{$network}->{$device}->{'LEVEL'};
 				if (!defined($$current{$pim}->{$network}->{$device}) ||
-				    ($$current{$pim}->{$network}->{$device} != $level)) {
+				    ($$current{$pim}->{$network}->{$device}->{'LEVEL'} != $level)) {
  					my $type = popkey($$devices{$device}->{'TYPE'});
  					next if ($type =~ /Virtual/i);
-					$$current{$pim}->{$network}->{$device} = $level;
+					$$current{$pim}->{$network}->{$device}->{'LEVEL'} = $level;
 					my $friendly = popkey($$devices{$device}->{'FRIENDLY'});
 					my $name = popkey($$devices{$device}->{'NAME'});
 					my $dimmable = popkey($$devices{$device}->{'DIMMER'});
@@ -1080,8 +1186,13 @@ sub findDeviceByName {
 
 sub checkMonitorInput {
 	my $handle = shift;
+	my $buff;
 
-	my $buff = readRemote($handle);
+	if (ref($handle) eq 'GLOB') {
+		$buff = <$handle>;
+	} else {
+		$buff = readSocketRemote($handle);
+	}
 
 	if (!defined($buff) && (ref($handle) ne 'GLOB')) {
 		my $addr = $handle->peerhost;
@@ -1117,7 +1228,7 @@ sub checkMonitorInput {
 		};
 		($command =~ /state/i) && do {
 			my %empty;
-			return checkStateDifferences(\*STDOUT, \%empty);
+			return reportStateDifferences($handle, \%empty);
 		};
 		(($command =~ /exit/i) || ($command =~ /quit/i)) && do {
 			if (ref($handle) ne 'GLOB') {
@@ -1127,6 +1238,9 @@ sub checkMonitorInput {
 			}
 			exit;
 		};
+		($command =~ /status/i) && do {
+			reportDeviceStatus($handle);
+		};
 	}
 }
 
@@ -1134,7 +1248,7 @@ sub checkUPnPInput {
 	my $handle = shift;
 	my $listener = shift;
 
-	my $buff = readRemote($handle);
+	my $buff = readSocketRemote($handle);
 
 	if (!defined($buff)) {
 		my $addr = $handle->peerhost;
@@ -1147,7 +1261,7 @@ sub checkUPnPInput {
 
 	$buff =~ s/\n$//;
 
-	logEvent("DEBUG: Received UPnP command: $buff") if ($_DEBUG_);
+	logEvent("DEBUG: Received UPnP command: $buff") if ($_DEBUG_ & DEBUG_UPNP);
 
 	SWITCH: {
 		(($buff =~ /M-SEARCH/i) && ($buff =~ /$UPNP_VENDOR/)) && do {
@@ -1171,6 +1285,7 @@ sub checkUPnPInput {
 
 sub handleUPnPSearch {
 	my $handle = shift;
+	my %all;
 
 	my $host_ip = Net::Address::IP::Local->public;
 
@@ -1183,30 +1298,49 @@ sub handleUPnPSearch {
 			foreach my $device (sort keys %{$devices}) {
 				my $name = popkey($$devices{$device}->{'WEMO_NAME'});
 				my $upnp_port = popkey($$devices{$device}->{'UPNP_PORT'});
-				my $serial = makeSerial($name);
-				my $p_uuid = "Socket-1_0-".$serial;
-				my $uuid   = uuid_to_string(create_uuid(UUID_V4));
-		
-				my $message = "HTTP/1.1 200 OK\r\n".
-					      "CACHE-CONTROL: max-age=86400\r\n".
-				 	      "DATE: ".gmtime()." GMT\r\n".
-					      "EXT:\r\n".
-					      "LOCATION: http://".$host_ip.":".$upnp_port."/setup.xml\r\n".
-					      "OPT: \"http://schemas.upnp.org/upnp/1/0/\"; ns=01\r\n".
-					      "01-NLS: ".$uuid."\r\n".
-					      "SERVER: Unspecified, UPnP/1.0, Unspecified\r\n".
-					      "ST: urn:".$UPNP_VENDOR.":**\r\n".
-					      "USN: uuid:".$p_uuid."::urn:".$UPNP_VENDOR.":**\r\n".
-					      "X-User-Agent: redsonic\r\n\r\n";
 
-				my $peer_host = $handle->peerhost();
-				my $peer_port = $handle->peerport();
-
-				$handle->mcast_send($message, $peer_host.":".$peer_port);
-
-				sleep .2;
+				$all{$name} = $upnp_port;
 			}
 		}
+	}
+
+	my $scenes = $$CONFIG{'SCENES'};
+
+	foreach my $scene (keys %{$$scenes{'SCENE'}}) {
+		my $name = popkey($$scenes{'SCENE'}->{$scene}->{'WEMO_NAME'});
+		my $upnp_port = popkey($$scenes{'SCENE'}->{$scene}->{'UPNP_PORT'});
+
+		$all{$name} = $upnp_port;
+	}
+
+	foreach my $name (keys %all) {
+		my $upnp_port = $all{$name};
+
+		my $serial = makeSerial($name);
+		my $p_uuid = "Socket-1_0-".$serial;
+		my $uuid   = uuid_to_string(create_uuid(UUID_V4));
+		
+		my $message = "HTTP/1.1 200 OK\r\n".
+			      "CACHE-CONTROL: max-age=86400\r\n".
+		 	      "DATE: ".gmtime()." GMT\r\n".
+			      "EXT:\r\n".
+			      "LOCATION: http://".$host_ip.":".$upnp_port."/setup.xml\r\n".
+			      "OPT: \"http://schemas.upnp.org/upnp/1/0/\"; ns=01\r\n".
+			      "01-NLS: ".$uuid."\r\n".
+			      "SERVER: Unspecified, UPnP/1.0, Unspecified\r\n".
+			      "ST: urn:".$UPNP_VENDOR.":**\r\n".
+			      "USN: uuid:".$p_uuid."::urn:".$UPNP_VENDOR.":**\r\n".
+			      "X-User-Agent: redsonic\r\n\r\n";
+
+		my $peer_host = $handle->peerhost();
+		my $peer_port = $handle->peerport();
+
+		logEvent("UPNP SEARCH: $message")
+		  if ($_DEBUG_ & DEBUG_UPNP);
+
+		$handle->mcast_send($message, $peer_host.":".$peer_port);
+
+		sleep .2;
 	}
 }
 
@@ -1244,13 +1378,22 @@ sub handleUPnPEvent {
 	my $handle = shift;
 	my $buff = shift;
 	my $parms = shift;
+	my $state;
 
 	if ($buff =~ /\<BinaryState\>1\<\/BinaryState\>/) {
 		logEvent("Received UPnP ON event.");
-		setDeviceState($$parms->{'PIM'}, $$parms->{'NETWORK'}, $$parms->{'DEVICE'}, 'ON');
+		$state = 'ON';
 	} elsif ($buff =~ /\<BinaryState\>0\<\/BinaryState\>/) {
 		logEvent("Received UPnP OFF event.");
-		setDeviceState($$parms->{'PIM'}, $$parms->{'NETWORK'}, $$parms->{'DEVICE'}, 'OFF');
+		$state = 'OFF';
+	}
+
+	if ($state) {
+		if ($$parms->{'TYPE'} eq TYPE_DEVICE) {
+			setDeviceState($$parms->{'PIM'}, $$parms->{'NETWORK'}, $$parms->{'DEVICE'}, $state);
+		} elsif ($$parms{'TYPE'} eq TYPE_SCENE) {
+			setSceneState($$parms->{'NAME'}, $state);
+		}
 	}
 
 	my $soap = "";
@@ -1274,7 +1417,7 @@ sub getDeviceState {
 	my %data;
 
 	logEvent("PIM '$pim': Getting device state on network $network device $device.")
-	  if ($_DEBUG_);
+	  if ($_DEBUG_ & DEBUG_UPB);
 
 	my $pims = $$CONFIG{'PIMS'}->{'PIM'};
 	my $source = popkey($$pims{$pim}->{'DEVICE'});
@@ -1288,11 +1431,24 @@ sub storeDeviceState {
 	my $device_id = shift;
 	my $level = shift;
 
+	(tied %DEV_STATES)->shlock;
+	$DEV_STATES{$pim}->{$network_id}->{$device_id}->{'LEVEL'} = $level;
+	(tied %DEV_STATES)->shunlock;
+}
+
+sub storeDeviceStatus {
+	my $pim = shift;
+	my $network_id = shift;
+	my $device_id = shift;
+	my $signal = shift;
+	my $noise = shift;
+
 	logEvent("PIM '$pim': Device $device_id on network $network_id ".
-	  "changed level to $level.");
+	  "changed signal/noise to $signal/$noise.");
 
 	(tied %DEV_STATES)->shlock;
-	$DEV_STATES{$pim}->{$network_id}->{$device_id} = $level;
+	$DEV_STATES{$pim}->{$network_id}->{$device_id}->{'SIGNAL'} = $signal;
+	$DEV_STATES{$pim}->{$network_id}->{$device_id}->{'NOISE'} = $noise;
 	(tied %DEV_STATES)->shunlock;
 }
 
@@ -1302,10 +1458,59 @@ sub reportDeviceState {
 	my $device_id = shift;
 
 	(tied %DEV_STATES)->shlock;
-	my $level = $DEV_STATES{$pim}->{$network_id}->{$device_id};
+	my $level = $DEV_STATES{$pim}->{$network_id}->{$device_id}->{'LEVEL'};
 	(tied %DEV_STATES)->shunlock;
 
 	return $level;
+}
+
+sub reportDeviceStatus {
+	my $handle = shift;
+
+	(tied %DEV_STATES)->shlock;
+	foreach my $pim (keys %DEV_STATES) {
+		foreach my $network (sort keys %{$DEV_STATES{$pim}}) {
+			foreach my $device (sort keys %{$DEV_STATES{$pim}->{$network}}) {
+				my $signal = $DEV_STATES{$pim}->{$network}->{$device}->{'SIGNAL'};
+				my $noise = $DEV_STATES{$pim}->{$network}->{$device}->{'NOISE'};
+
+				if (defined($$CONFIG{'NETWORKS'}->{'PIM'}->{$pim}) &&
+				    defined($$CONFIG{'NETWORKS'}->{'PIM'}->{$pim}->{'NETWORK'}->{$network})) {
+					my $devices = $$CONFIG{'NETWORKS'}->{'PIM'}->{$pim}->{'NETWORK'}->{$network}->{'DEVICE'};
+
+					if (defined($$devices{$device})) {
+						my $name = popkey($$devices{$device}->{'NAME'});
+						print $handle "STATUS:$name:$signal:$noise\n";
+					}
+				}
+			}
+		}
+	}
+	(tied %DEV_STATES)->shunlock;
+}
+
+sub setClearToReceive {
+	my $pim = shift;
+	my $clear = shift;
+
+	$clear = time() if (!$clear);
+
+	(tied %CTR)->shlock;
+	$CTR{$pim} = $clear;
+	(tied %CTR)->shunlock;
+}
+
+sub isClearToReceive {
+	my $pim = shift;
+	my $clear;
+
+	(tied %CTR)->shlock;
+	$clear = $CTR{$pim};
+	(tied %CTR)->shunlock;
+
+	return FALSE if ($clear > 1);
+
+	return $clear;
 }
 
 sub setClearToSend {
@@ -1321,7 +1526,7 @@ sub setClearToSend {
 
 sub isClearToSend {
 	my $pim = shift;
-	my $clear = shift;
+	my $clear;
 
 	(tied %CTS)->shlock;
 	$clear = $CTS{$pim};
@@ -1468,7 +1673,7 @@ sub acknowledgePending {
 	my $argument = $$pending{'argument1'};
 
 	logEvent("PIM '$pim': Acknowledging first pending command $device:$command:$argument.")
-	  if ($_DEBUG_);
+	  if ($_DEBUG_ & DEBUG_UPB);
 
 	if ($command == DEV_GOTO) {
 		storeDeviceState($pim, $network, $device, $argument);
@@ -1488,7 +1693,7 @@ sub addPendingQueue {
 	my %pending;
 
 	logEvent("PIM '$pim': Adding pending command $command on network $network for device $device.")
-	  if ($_DEBUG_);
+	  if ($_DEBUG_ & DEBUG_UPB);
 
 	$pending{'network'}   = $network;
 	$pending{'source'}    = $source;
@@ -1660,7 +1865,8 @@ sub parseResponse {
 			parseUPBMessage($pim, $data);
 		} elsif ($type eq 'R') {
 			$response = UPB_REGISTER;
-			$REGISTERS{$pim} = parseRegisters($data);
+			my $registers = parseRegisters($data);
+			$REGISTERS{$pim} = $registers if (defined($registers));
 			deQueueCommand($pim);
 			setClearToSend($pim, TRUE);
 		}
@@ -1678,17 +1884,34 @@ sub parseUPBMessage {
 	return if (!defined($decoded));
 
 	if ($$decoded{'msg_set_id'} == MSG_TYPE_CORE_RPT) {
+		my $network_id = $$decoded{'network_id'};
+		my $device_id = $$decoded{'source_id'};
+
+		logEvent("Received UPB core report message for device $device_id on network $network_id.")
+		  if ($_DEBUG_ & DEBUG_UPB);
+
 		if ($$decoded{'msg_id'} == RPT_DEVICE_STATE) {
-			my $network_id = $$decoded{'network_id'};
-			my $device_id = $$decoded{'source_id'};
 			my $level = @{$$decoded{'msg_arguments'}}[0];
 			storeDeviceState($pim, $network_id, $device_id, $level);
+		} elsif ($$decoded{'msg_id'} == RPT_DEV_SIGNATURE) {
+			my $rnd_num = hex(range($$decoded{'msg_arguments'}, 0, 2));
+			my $signal = hex(range($$decoded{'msg_arguments'}, 2, 1));
+			my $noise = hex(range($$decoded{'msg_arguments'}, 3, 1));
+			my $dev_cksum = hex(range($$decoded{'msg_arguments'}, 4, 2));
+			my $dev_reg_cksum = hex(range($$decoded{'msg_arguments'}, 6, 2));
+			my $num_registers = hex(range($$decoded{'msg_arguments'}, 8, 1));
+			my $diagnostic = range($$decoded{'msg_arguments'}, 9, 8);
+			storeDeviceStatus($pim, $network_id, $device_id, $signal, $noise);
 		}
 	} elsif ($$decoded{'msg_set_id'} == MSG_TYPE_DEVICE) {
+		my $source_id = $$decoded{'source_id'};
+		my $device_id = $$decoded{'destination_id'};
+		my $network_id = $$decoded{'network_id'};
+
+		logEvent("Received UPB link message for device $device_id on network $network_id, source $source_id.")
+		  if ($_DEBUG_ & DEBUG_UPB);
+
 		if ($$decoded{'link'} == LINK_TYPE_DEVICE) {
-			my $source_id = $$decoded{'source_id'};
-			my $device_id = $$decoded{'destination_id'};
-			my $network_id = $$decoded{'network_id'};
 			my $command = $$decoded{'msg_id'};
 			checkLink($pim, $network_id, $source_id, $device_id, $command);
 		}
@@ -1729,29 +1952,38 @@ sub parseRegisters {
 	my $pos = 0;
 	my @reg_a;
 
+	if ($_DEBUG_ & DEBUG_UPB) {
+		logEvent("Register Dump:");
+		logEvent(hex_ascii(to_hex($data)));
+	}
+
 	my $_registers = pack("H*", substr($data, 0, length($data)));
 	@reg_a = unpack("C*", $_registers);
 
-	# Return code of the previous register write command
-	$registers{'PREV_WRITE'}      = shift @reg_a;
+	if ($#reg_a == 0xff) {
+		# Return code of the previous register write command
+		$registers{'PREV_WRITE'}      = shift @reg_a;
 
-	$registers{'NETWORK_ID'}      = range(\@reg_a, 0, 1);
-	$registers{'MODULE_ID'}       = range(\@reg_a, 1, 1);
-	$registers{'NETWORK_PASS'}    = range(\@reg_a, 2, 2);
-	$registers{'UPB_OPTIONS'}     = range(\@reg_a, 4, 1);
-	$registers{'UPB_VERSION'}     = range(\@reg_a, 5, 1);
-	$registers{'MANUFACTURER_ID'} = range(\@reg_a, 6, 2);
-	$registers{'PRODUCT_ID'}      = range(\@reg_a, 8, 2);
-	$registers{'FIRMWARE_VER'}    = range(\@reg_a, 10, 2);
-	$registers{'SERIAL_NUMBER'}   = range(\@reg_a, 12, 4);
-	$registers{'RESERVED1'}       = range(\@reg_a, 16, 96);
-	$registers{'PIM_OPTIONS'}     = range(\@reg_a, 112, 1);
-	$registers{'RESERVED2'}       = range(\@reg_a, 113, 136);
-	$registers{'SIGNAL_STRENGTH'} = range(\@reg_a, 249, 1);
-	$registers{'NOISE_FLOOR'}     = range(\@reg_a, 250, 1);
-	$registers{'NOISE_COUNTS'}    = range(\@reg_a, 251, 5);
+		$registers{'NETWORK_ID'}      = range(\@reg_a, 0, 1);
+		$registers{'MODULE_ID'}       = range(\@reg_a, 1, 1);
+		$registers{'NETWORK_PASS'}    = range(\@reg_a, 2, 2);
+		$registers{'UPB_OPTIONS'}     = range(\@reg_a, 4, 1);
+		$registers{'UPB_VERSION'}     = range(\@reg_a, 5, 1);
+		$registers{'MANUFACTURER_ID'} = range(\@reg_a, 6, 2);
+		$registers{'PRODUCT_ID'}      = range(\@reg_a, 8, 2);
+		$registers{'FIRMWARE_VER'}    = range(\@reg_a, 10, 2);
+		$registers{'SERIAL_NUMBER'}   = range(\@reg_a, 12, 4);
+		$registers{'RESERVED1'}       = range(\@reg_a, 16, 96);
+		$registers{'PIM_OPTIONS'}     = range(\@reg_a, 112, 1);
+		$registers{'RESERVED2'}       = range(\@reg_a, 113, 136);
+		$registers{'SIGNAL_STRENGTH'} = range(\@reg_a, 249, 1);
+		$registers{'NOISE_FLOOR'}     = range(\@reg_a, 250, 1);
+		$registers{'NOISE_COUNTS'}    = range(\@reg_a, 251, 5);
 
-	return \%registers;
+		return \%registers;
+	}
+
+	return undef;
 }
 
 sub range {
@@ -1844,7 +2076,7 @@ sub decodeUPBPacket {
 	if (($data{'count'} > 0) && ($data{'sequence'} > 0)) {
 		$seen = comparePackets(\%data);
 		logEvent("Duplicate packet, ignoring.")
-		  if ($seen && $_DEBUG_);
+		  if ($seen && ($_DEBUG_ & DEBUG_UPB));
 	}
 
 	$LAST_PACKET = \%data;
@@ -2024,7 +2256,7 @@ sub popkey {
 }
 
 ##################################################################
-# Logging
+# Logging and Debugging
 ##################################################################
 
 sub logEvent {
@@ -2032,6 +2264,52 @@ sub logEvent {
 	my $when = localtime();
 
 	print "$when upb.pl($$): $event\n";
+}
+
+sub to_hex {
+	my $string = shift;
+	my @array = map(ord, split(//, $string));
+
+	return \@array;
+}
+
+sub hex_ascii {
+	my $section_a = shift;
+	my $hex;
+	my $ascii;
+	my @section_a;
+	my $buf;
+
+	$buf = "\n";
+
+	for (my $i = 0; $i <= $#{$section_a}; $i++) {
+		$hex = $ascii = undef;
+		my $i_t = sprintf("%04x", $i);
+		for (my $x = 0; $x < 16; $x++) {
+			if ($i > $#{$section_a}) {
+				$hex .= '   ';
+				$ascii .= ' ';
+			} else {
+				my $char = $$section_a[$i++];
+				$hex .= ' '.sprintf("%02x", $char);
+				if (($char >= 32) && ($char < 127)) {
+					$ascii .= chr($char);
+				} else {
+					$ascii .= '.';
+				}
+			}
+
+			$hex .= '  ' if ($x == 7);
+		}
+
+		$i--;
+
+		$buf .= "$i_t: $hex   $ascii\n";
+	}
+
+	$buf .= "\n";
+
+	return $buf;
 }
 
 ##################################################################
@@ -2066,6 +2344,7 @@ sub childDied {
 		(tied %IN_QUEUE)->remove;
 		(tied %OUT_QUEUE)->remove;
 		(tied %CTS)->remove;
+		(tied %CTR)->remove;
 		(tied %DEV_STATES)->remove;
 		(tied %DEV_SETS)->remove;
 
