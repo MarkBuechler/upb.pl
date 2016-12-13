@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-my $Version  = 'UPB Interface v1.3';
+my $Version  = 'UPB Interface v1.32';
 
 # UPB Interface
 #
@@ -73,7 +73,7 @@ use constant {
 	TYPE_DEVICE		=> 0x01,
 	TYPE_SCENE		=> 0x02,
 
-	SIG_CHECK_INTERVAL	=> 300,
+	SIG_CHECK_INTERVAL	=> 1800,
 
 	UPB_ACCEPT		=> 0x00,
 	UPB_ACK			=> 0x01,
@@ -183,7 +183,7 @@ my $UPNP_CHILD;
 
 my $LAST_PACKET;
 
-my $UPNP_VENDOR = "Belkin\:device";
+my $UPNP_VENDOR = "Belkin";
 my @UPNP_DEV_SOCKETS;
 my %UPNP_SOCKET_NAME;
 
@@ -353,6 +353,12 @@ sub startServer {
 		setMessageMode($pim);
 		getRegisters($pim, 0, 0xff);
 
+		my $signal = $REGISTERS{$pim}->{'SIGNAL_STRENGTH'};
+		my $noise_counts = $REGISTERS{$pim}->{'NOISE_COUNTS'};
+		my $noise_floor = $REGISTERS{$pim}->{'NOISE_FLOOR'};
+
+		logEvent("PIM reports signal/noise floor/noise counts: $signal/$noise_floor/$noise_counts.");
+
 		setupPIM($pim, $network, $password, $device);
 	}
 
@@ -370,7 +376,7 @@ sub startServer {
 
 	logEvent("Opening listening port on $listen.");
 
-	my $host_ip = Net::Address::IP::Local->public;
+	my $host_ip = popkey($$CONFIG{'WEMO'}->{'UPNP_BIND_IP'});
 	my $listener = openListenSocket($host_ip, $listen);
 
 	$0 = "upb.pl (Server)";
@@ -587,8 +593,9 @@ sub openUPnPDeviceSockets {
 		fcntl($socket, F_SETFL(), O_NONBLOCK());
 
 		push @UPNP_DEV_SOCKETS, $socket;
-		$UPNP_SOCKET_NAME{$socket}->{'NAME'}    = $name;
-		$UPNP_SOCKET_NAME{$socket}->{'TYPE'}    = TYPE_SCENE;
+		$UPNP_SOCKET_NAME{$socket}->{'NAME'}  = $name;
+		$UPNP_SOCKET_NAME{$socket}->{'SCENE'} = $scene;
+		$UPNP_SOCKET_NAME{$socket}->{'TYPE'}  = TYPE_SCENE;
 	}
 }
 
@@ -1264,7 +1271,7 @@ sub checkUPnPInput {
 	logEvent("DEBUG: Received UPnP command: $buff") if ($_DEBUG_ & DEBUG_UPNP);
 
 	SWITCH: {
-		(($buff =~ /M-SEARCH/i) && ($buff =~ /$UPNP_VENDOR/)) && do {
+		(($buff =~ /M-SEARCH/i) && ($buff =~ /$UPNP_VENDOR\:device/)) && do {
 			logEvent("Received UPnP search command.");
 			sleep .5;
 
@@ -1287,7 +1294,7 @@ sub handleUPnPSearch {
 	my $handle = shift;
 	my %all;
 
-	my $host_ip = Net::Address::IP::Local->public;
+	my $host_ip = popkey($$CONFIG{'WEMO'}->{'UPNP_BIND_IP'});
 
 	my $pims = $$CONFIG{'NETWORKS'}->{'PIM'};
 
@@ -1317,7 +1324,7 @@ sub handleUPnPSearch {
 		my $upnp_port = $all{$name};
 
 		my $serial = makeSerial($name);
-		my $p_uuid = "Socket-1_0-".$serial;
+		my $p_uuid = "Lightswitch-1_0-".$serial;
 		my $uuid   = uuid_to_string(create_uuid(UUID_V4));
 		
 		my $message = "HTTP/1.1 200 OK\r\n".
@@ -1328,8 +1335,8 @@ sub handleUPnPSearch {
 			      "OPT: \"http://schemas.upnp.org/upnp/1/0/\"; ns=01\r\n".
 			      "01-NLS: ".$uuid."\r\n".
 			      "SERVER: Unspecified, UPnP/1.0, Unspecified\r\n".
-			      "ST: urn:".$UPNP_VENDOR.":**\r\n".
-			      "USN: uuid:".$p_uuid."::urn:".$UPNP_VENDOR.":**\r\n".
+			      "ST: urn:".$UPNP_VENDOR.":device:**\r\n".
+			      "USN: uuid:".$p_uuid."::urn:".$UPNP_VENDOR.":device:**\r\n".
 			      "X-User-Agent: redsonic\r\n\r\n";
 
 		my $peer_host = $handle->peerhost();
@@ -1354,11 +1361,11 @@ sub handleUPnPSetup {
 	my $xml = "<?xml version=\"1.0\"?>\r\n".
 		  "<root>\r\n".
 		  "  <device>\r\n".
-		  "    <deviceType>urn:Mentasm:device:controllee:1</deviceType>\r\n".
+		  "    <deviceType>urn:Mentasm:device:lightswitch:1</deviceType>\r\n".
 		  "    <friendlyName>".$name."</friendlyName>\r\n".
 		  "    <manufacturer>Belkin International Inc.</manufacturer>\r\n".
 		  "    <modelName>Emulated Socket</modelName>\r\n".
-		  "    <modelNumber>3.1415</modelNumber>\r\n".
+		  "    <modelNumber>1</modelNumber>\r\n".
 		  "    <UDN>uuid:".$p_uuid."</UDN>\r\n".
 		  "  </device>\r\n".
 		  "</root>\r\n";
@@ -1386,13 +1393,15 @@ sub handleUPnPEvent {
 	} elsif ($buff =~ /\<BinaryState\>0\<\/BinaryState\>/) {
 		logEvent("Received UPnP OFF event.");
 		$state = 'OFF';
+	} elsif ($buff =~ /GetBinaryState/) {
+		reportUPnPDeviceState($handle, $parms);
 	}
 
 	if ($state) {
 		if ($$parms->{'TYPE'} eq TYPE_DEVICE) {
 			setDeviceState($$parms->{'PIM'}, $$parms->{'NETWORK'}, $$parms->{'DEVICE'}, $state);
-		} elsif ($$parms{'TYPE'} eq TYPE_SCENE) {
-			setSceneState($$parms->{'NAME'}, $state);
+		} elsif ($$parms->{'TYPE'} eq TYPE_SCENE) {
+			setSceneState($$parms->{'SCENE'}, $state);
 		}
 	}
 
@@ -1452,6 +1461,29 @@ sub storeDeviceStatus {
 	(tied %DEV_STATES)->shunlock;
 }
 
+sub reportUPnPDeviceState {
+	my $handle = shift;
+	my $parms = shift;
+	my $state;
+
+	if ($$parms->{'TYPE'} eq TYPE_DEVICE) {
+		$state = (reportDeviceState($$$parms->{'PIM'}, $$parms->{'NETWORK'}, $$parms->{'DEVICE'}) ? TRUE : FALSE); 
+	} elsif ($$parms->{'TYPE'} eq TYPE_SCENE) {
+		$state = reportSceneState($$parms->{'SCENE'});
+	}
+
+	my $message = "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" ".
+		      "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\r\n".
+		      " <s:Body>\r\n".
+		      "   <u:GetBinaryStateResponse xmlns:u=\"urn:".$UPNP_VENDOR.":service:basicevent:1\">\r\n".
+		      "     <BinaryState>$state</BinaryState>\r\n".
+		      "   </u:GetBinaryStateResponse>\r\n".
+		      " </s:Body>\r\n".
+		      "</s:Envelope>\r\n";
+
+	print $handle $message;
+}
+
 sub reportDeviceState {
 	my $pim = shift;
 	my $network_id = shift;
@@ -1462,6 +1494,22 @@ sub reportDeviceState {
 	(tied %DEV_STATES)->shunlock;
 
 	return $level;
+}
+
+sub reportSceneState {
+	my $scene = shift;
+	my $state = TRUE;
+
+	if (defined($$CONFIG{'SCENES'}->{'SCENE'}->{$scene})) {
+		foreach my $name (keys %{$$CONFIG{'SCENES'}->{'SCENE'}->{$scene}->{'NAME'}}) {
+			my($pim, $network, $device) = findDeviceByName($name);
+			$state = FALSE if (!reportDeviceState($pim, $network, $device));
+		}
+	} else {
+		$state = FALSE;
+	}
+
+	return $state;
 }
 
 sub reportDeviceStatus {
@@ -1625,6 +1673,9 @@ sub setDeviceState {
 
 	my $pims = $$CONFIG{'PIMS'}->{'PIM'};
 	my $source = popkey($$pims{$pim}->{'DEVICE'});
+
+	logEvent("Queue device set command for pim $pim, network $network, source $source device $device state $state arguments $argument.")
+	  if ($_DEBUG_ & DEBUG_UPB);
 
 	queueDeviceSet($pim, $network, $source, $device, $state, $argument);
 }
@@ -1887,11 +1938,11 @@ sub parseUPBMessage {
 		my $network_id = $$decoded{'network_id'};
 		my $device_id = $$decoded{'source_id'};
 
-		logEvent("Received UPB core report message for device $device_id on network $network_id.")
-		  if ($_DEBUG_ & DEBUG_UPB);
-
 		if ($$decoded{'msg_id'} == RPT_DEVICE_STATE) {
 			my $level = @{$$decoded{'msg_arguments'}}[0];
+			logEvent("Received UPB core report message type RPT_DEVICE_STATE for device $device_id on network $network_id, level $level.")
+			  if ($_DEBUG_ & DEBUG_UPB);
+
 			storeDeviceState($pim, $network_id, $device_id, $level);
 		} elsif ($$decoded{'msg_id'} == RPT_DEV_SIGNATURE) {
 			my $rnd_num = hex(range($$decoded{'msg_arguments'}, 0, 2));
@@ -1901,6 +1952,10 @@ sub parseUPBMessage {
 			my $dev_reg_cksum = hex(range($$decoded{'msg_arguments'}, 6, 2));
 			my $num_registers = hex(range($$decoded{'msg_arguments'}, 8, 1));
 			my $diagnostic = range($$decoded{'msg_arguments'}, 9, 8);
+
+			logEvent("Received UPB core report message type RPT_DEV_SIGNATURE for device $device_id on network $network_id, signal $signal, noise $noise.")
+			  if ($_DEBUG_ & DEBUG_UPB);
+
 			storeDeviceStatus($pim, $network_id, $device_id, $signal, $noise);
 		}
 	} elsif ($$decoded{'msg_set_id'} == MSG_TYPE_DEVICE) {
@@ -2358,5 +2413,7 @@ sub childDied {
 		logEvent("Removing client PID $child.");
 		delete $CLIENTS{$child};
 	}
+
+	$SIG{CHLD} = \&childDied;
 }
 
